@@ -45,6 +45,15 @@ class BrowserConfig:
 		browser_instance_path: None
 			Path to a Browser instance to use to connect to your normal browser
 			e.g. '/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome'
+
+		user_data_dir: None
+			Path to a User Data Directory, which stores browser session data like cookies and local storage.
+			When specified, the browser will use this directory to store all profile data.
+
+		profile_directory: None
+			Name of the profile directory to use within the user_data_dir.
+			For example, "Default" or "Profile 1" for Chrome/Chromium browsers.
+			Only applicable when user_data_dir is specified.
 	"""
 
 	headless: bool = False
@@ -53,6 +62,8 @@ class BrowserConfig:
 	browser_instance_path: str | None = None
 	wss_url: str | None = None
 	cdp_url: str | None = None
+	user_data_dir: str | None = None
+	profile_directory: str | None = None
 
 	proxy: ProxySettings | None = field(default=None)
 	new_context_config: BrowserContextConfig = field(default_factory=BrowserContextConfig)
@@ -80,6 +91,7 @@ class Browser:
 		self.config = config
 		self.playwright: Playwright | None = None
 		self.playwright_browser: PlaywrightBrowser | None = None
+		self._persistent_context = None
 
 		self.disable_security_args = []
 		if self.config.disable_security:
@@ -99,6 +111,12 @@ class Browser:
 			return await self._init()
 
 		return self.playwright_browser
+
+	async def get_persistent_context(self):
+		"""Get the persistent context if using user_data_dir"""
+		if self._persistent_context is None and self.playwright is None:
+			await self._init()
+		return self._persistent_context
 
 	@time_execution_async('--init (browser)')
 	async def _init(self):
@@ -220,13 +238,41 @@ class Browser:
 				'--no-startup-window',
 			],
 		}
-		browser = await browser_class.launch(
-			headless=self.config.headless,
-			args=args[self.config.browser_class] + self.disable_security_args + self.config.extra_browser_args,
-			proxy=self.config.proxy,
-		)
-		# convert to Browser
-		return browser
+
+		# Add profile directory to args if specified for Chromium
+		if self.config.profile_directory and self.config.browser_class == 'chromium':
+			args['chromium'].append(f'--profile-directory={self.config.profile_directory}')
+			logger.debug(f'Using profile directory: {self.config.profile_directory}')
+
+		# Base launch options for both methods
+		common_options = {
+			'headless': self.config.headless,
+			'args': args[self.config.browser_class] + self.disable_security_args + self.config.extra_browser_args,
+			'timeout': 60000,  # 60 second timeout to prevent hanging
+		}
+
+		if self.config.proxy:
+			common_options['proxy'] = self.config.proxy
+
+		try:
+			if self.config.user_data_dir:
+				logger.info(f'Using user data directory: {self.config.user_data_dir}')
+				
+				# When using user_data_dir, we create a persistent context
+				# instead of a regular browser
+				self._persistent_context = await browser_class.launch_persistent_context(
+					user_data_dir=self.config.user_data_dir,
+					**common_options
+				)
+				
+				# Return None since context initialization will use the persistent context
+				return None
+			else:
+				# Standard browser launch
+				return await browser_class.launch(**common_options)
+		except Exception as e:
+			logger.error(f'Failed to initialize browser: {str(e)}')
+			raise
 
 	async def _setup_browser(self, playwright: Playwright) -> PlaywrightBrowser:
 		"""Sets up and returns a Playwright Browser instance with anti-detection measures."""
@@ -247,6 +293,14 @@ class Browser:
 		"""Close the browser instance"""
 		try:
 			if not self.config._force_keep_browser_alive:
+				# Close persistent context first if it exists
+				if self._persistent_context:
+					try:
+						await self._persistent_context.close()
+					except Exception as e:
+						logger.debug(f'Failed to close persistent context: {e}')
+					self._persistent_context = None
+
 				if self.playwright_browser:
 					await self.playwright_browser.close()
 					del self.playwright_browser
@@ -260,6 +314,7 @@ class Browser:
 		finally:
 			self.playwright_browser = None
 			self.playwright = None
+			self._persistent_context = None
 
 			gc.collect()
 
